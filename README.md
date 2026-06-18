@@ -169,8 +169,6 @@ See [docs/architecture.md](docs/architecture.md) for the full gateway routing ta
 - [docs/architecture.md](docs/architecture.md) — system architecture.
 - [docs/dataset_choice.md](docs/dataset_choice.md) — chosen datasets (filled in Phase 1).
 - [docs/progress.md](docs/progress.md) — running progress log.
-- [reports/report_en.md](reports/report_en.md) — final report (English).
-- [reports/report_ar.md](reports/report_ar.md) — final report (Arabic).
 
 ## Repository Layout
 
