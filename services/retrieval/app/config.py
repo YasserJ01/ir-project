@@ -1,0 +1,175 @@
+"""Dense-retrieval service configuration.
+
+Centralizes paths and defaults for the FAISS + sentence-transformers
+service on port 8003. Mirrors the structure of
+``services.indexing.app.config`` so the two services feel symmetric.
+
+The Phase 1 preprocessed corpora are *not* the input here -- the
+sentence-transformer model has its own WordPiece BPE tokenizer and
+expects natural text. So the build script reads from
+``data/processed/{ds}/docs.jsonl`` (the raw text), not ``tokens.jsonl``.
+"""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+# ─────────────────────────────────────────────────────────────────────────
+# Paths (relative to the project root; resolved at import time)
+# ─────────────────────────────────────────────────────────────────────────
+
+# services/retrieval/app/config.py -> project root is 4 levels up.
+PROJECT_ROOT = Path(__file__).resolve().parents[3]
+
+# Phase 1 writes the raw docs here.
+DATA_ROOT: Path = PROJECT_ROOT / "data" / "processed"
+
+# Phase 2/3 share the same per-dataset index directory.
+INDEX_ROOT: Path = PROJECT_ROOT / "data" / "indexes"
+
+# Where sentence-transformers caches downloaded model weights.
+# ``make download-models`` populates this; the lazy load path in
+# ``embedder.py`` also writes here if it has to download.
+MODEL_CACHE_ROOT: Path = PROJECT_ROOT / "data" / "models"
+
+# Allowed dataset ids. Mirrors ``shared.ir_common.schemas.DATASET_IDS``.
+DATASETS: tuple[str, ...] = ("touche2020", "nq")
+
+# ─────────────────────────────────────────────────────────────────────────
+# Embedding model defaults
+# ─────────────────────────────────────────────────────────────────────────
+
+# Default encoder. 384-dim, fast on CPU, general-purpose.
+# Guide §3.1: "all-MiniLM-L6-v2 (384-dim, fast on CPU)".
+DEFAULT_MODEL_NAME: str = "sentence-transformers/all-MiniLM-L6-v2"
+
+# Second encoder for the multi-encoder hybrid (Phase 5 bonus).
+# Same embedding dim (384) so the FAISS index shape is identical
+# to the L6 index; only the weights differ. Deeper transformer
+# (12 layers vs 6) captures more context.
+SECOND_ENCODER_NAME: str = "sentence-transformers/all-MiniLM-L12-v2"
+
+# Filename suffix for the 2nd-encoder FAISS index. The L6 index
+# (Phase 3) is ``faiss.index``; the L12 index is ``faiss_l12.index``.
+# Same doc_ids.json (the corpus order is the same; only the
+# embedding vectors differ).
+SECOND_ENCODER_INDEX_FILENAME: str = "faiss_l12.index"
+SECOND_ENCODER_EMBEDDINGS_FILENAME: str = "embeddings_l12.npy"
+
+# Batch size for document encoding. 256 is the sweet spot on 12-core CPU
+# without blowing RAM: 256 * 128 tokens * 4 bytes ≈ 130 KB activations.
+# Empirically (5,000 touche2020 docs, mean 641 chars, GTX 1650, fp16):
+#   bs=256 -> 72 docs/sec, bs=512 -> 69 docs/sec, bs=1024 -> 66 docs/sec.
+# Larger batches actually slowed us down (encoder forward pass is the
+# bottleneck, not the GPU's matrix-multiply throughput). 256 wins.
+DEFAULT_BATCH_SIZE: int = 256
+DEFAULT_BATCH_SIZE_GPU: int = 256
+
+# Max sequence length the encoder will see. MiniLM truncates at 256
+# tokens; longer docs are clipped (the head and tail of each doc).
+MAX_SEQ_LENGTH: int = 256
+
+
+# Embedding device. We auto-detect CUDA at import time: if a GPU is
+# present and torch was built with CUDA support, the embedder lands on
+# ``cuda``; otherwise it falls back to ``cpu``. Set the env var
+# ``IR_EMBED_DEVICE=cuda|cpu`` to force one or the other.
+def _detect_device() -> str:
+    forced = os.environ.get("IR_EMBED_DEVICE")
+    if forced in ("cpu", "cuda"):
+        return forced
+    try:
+        import torch  # local; don't import at module top to keep cold
+
+        # imports fast.
+        if torch.cuda.is_available():
+            return "cuda"
+    except Exception:
+        pass
+    return "cpu"
+
+
+EMBED_DEVICE: str = _detect_device()
+
+# Whether to cast the model to float16 on GPU. On Turing (GTX 1650, CC
+# 7.5) and later, fp16 roughly doubles throughput with < 1% recall
+# drop for MiniLM-L6-v2. Has no effect on CPU.
+USE_FP16: bool = EMBED_DEVICE == "cuda"
+
+# LRU cache size for loaded models. One model is ~90-120 MB; in Phase
+# 5 we bump from 1 to 2 so the multi-encoder bonus can hold the L6
+# and L12 encoders in memory at the same time. Total weight: ~210 MB
+# (well under our 16 GB RAM budget).
+MODEL_CACHE_SIZE: int = 2
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# FAISS defaults
+# ─────────────────────────────────────────────────────────────────────────
+
+# Both datasets are well under 1M vectors, so the exact IndexFlatIP
+# wins on simplicity + reproducibility (the latter matters for Phase 9
+# evaluation: every run with the same embeddings returns the same
+# scores). When the corpus grows past ~1M, swap to IndexIVFFlat with
+# nlist=4096, nprobe=16 (guide §3.3).
+FAISS_INDEX_TYPE: str = os.environ.get("FAISS_INDEX_TYPE", "IndexFlatIP")
+
+# Number of inverted-list centroids for IndexIVFFlat. FAISS recommends
+# 4*sqrt(N) to 16*sqrt(N) — for 500K docs that's ~2,800 to ~11,300.
+# Default 4096 is a safe middle ground.
+FAISS_IVF_NLIST: int = int(os.environ.get("FAISS_IVF_NLIST", "4096"))
+
+# Number of centroids to probe at search time for IndexIVFFlat.
+# Higher nprobe → better recall, slower search. 16 is a common default.
+FAISS_IVF_NPROBE: int = int(os.environ.get("FAISS_IVF_NPROBE", "16"))
+
+
+# ─────────────────────────────────────────────────────────────────────────
+# Helpers
+# ─────────────────────────────────────────────────────────────────────────
+
+
+def index_dir(dataset_id: str) -> Path:
+    """Return the on-disk directory for a dataset's indexes."""
+    return INDEX_ROOT / dataset_id
+
+
+def docs_path(dataset_id: str) -> Path:
+    """Return the path to a dataset's raw ``docs.jsonl`` (Phase 1 output)."""
+    return DATA_ROOT / dataset_id / "docs.jsonl"
+
+
+def model_cache_dir(model_name: str) -> Path:
+    """Return the local cache directory for a sentence-transformers model.
+
+    Maps the Hugging Face hub name to a filesystem-safe directory name
+    (e.g. ``sentence-transformers/all-MiniLM-L6-v2`` ->
+    ``sentence-transformers__all-MiniLM-L12-v2``).
+    """
+    safe = model_name.replace("/", "__")
+    return MODEL_CACHE_ROOT / safe
+
+
+def second_encoder_index_path(dataset_id: str) -> Path:
+    """Return the path to the 2nd-encoder FAISS index for ``dataset_id``.
+
+    Mirrors :func:`index_dir` for the L12 encoder. Returns
+    ``data/indexes/<dataset_id>/faiss_l12.index``.
+    """
+    return index_dir(dataset_id) / SECOND_ENCODER_INDEX_FILENAME
+
+
+def second_encoder_embeddings_path(dataset_id: str) -> Path:
+    """Return the path to the 2nd-encoder embeddings.npy for ``dataset_id``."""
+    return index_dir(dataset_id) / SECOND_ENCODER_EMBEDDINGS_FILENAME
+
+
+def has_second_encoder_index(dataset_id: str) -> bool:
+    """True iff the 2nd-encoder FAISS index has been built for ``dataset_id``.
+
+    Used by the /multi-encoder endpoint to decide between 200 (live) and
+    503 (build pending).
+    """
+    p = second_encoder_index_path(dataset_id)
+    return p.exists() and (index_dir(dataset_id) / "build_meta_l12.json").exists()

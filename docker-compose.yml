@@ -1,0 +1,210 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Production docker-compose for the IR project (Phase 6).
+#
+# Usage:
+#   docker compose -f docker-compose.yml build         # CPU only
+#   docker compose -f docker-compose.yml up -d         # CPU only
+#   docker compose -f docker-compose.yml down
+#
+# GPU overlay (Phase 5 dense L12 + Phase 3 L6 stay on CPU by default;
+# GPU only needed for re-encoding the corpus):
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml build
+#   docker compose -f docker-compose.yml -f docker-compose.gpu.yml up -d
+#
+# Service topology:
+#   ui (5173) → gateway (8000) → preprocessing/indexing/retrieval/refinement/rag (8000)
+#   Backend containers use port 8000 internally and are addressable by
+#   service name (DNS): http://preprocessing:8000, etc.
+# ─────────────────────────────────────────────────────────────────────────────
+
+services:
+  # ─── Frontend (static React build + nginx reverse proxy) ──────────────────
+  ui:
+    build:
+      context: ./services/ui
+      dockerfile: Dockerfile
+    image: ir-project/ui:latest
+    container_name: ir_ui
+    restart: unless-stopped
+    ports:
+      - "3000:80"   # http://localhost:3000
+    depends_on:
+      gateway:
+        condition: service_healthy
+    networks: [irnet]
+
+  # ─── API gateway (single public entry point for the UI) ───────────────────
+  gateway:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: gateway
+    image: ir-project/gateway:latest
+    container_name: ir_gateway
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      PREPROCESSING_URL: "http://preprocessing:8000"
+      INDEXING_URL: "http://indexing:8000"
+      RETRIEVAL_URL: "http://retrieval:8000"
+      REFINEMENT_URL: "http://refinement:8000"
+      RAG_URL: "http://rag:8000"
+      CLUSTERING_URL: "http://clustering:8000"
+      GATEWAY_DOWNSTREAM_TIMEOUT: "30"
+      GATEWAY_HEALTH_TIMEOUT: "0.5"
+      GATEWAY_CORS_ORIGINS: "http://localhost:3000,http://localhost:5173,http://127.0.0.1:3000,http://127.0.0.1:5173"
+    depends_on:
+      preprocessing:
+        condition: service_healthy
+      indexing:
+        condition: service_healthy
+      retrieval:
+        condition: service_healthy
+      refinement:
+        condition: service_healthy
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # ─── Backend services (CPU default) ───────────────────────────────────────
+  preprocessing:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: preprocessing
+    image: ir-project/preprocessing:latest
+    container_name: ir_preprocessing
+    restart: unless-stopped
+    expose:
+      - "8000"
+    volumes:
+      - ./data:/app/data
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  indexing:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: indexing
+    image: ir-project/indexing:latest
+    container_name: ir_indexing
+    restart: unless-stopped
+    expose:
+      - "8000"
+    volumes:
+      - ./data:/app/data
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  retrieval:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: retrieval
+    image: ir-project/retrieval:latest
+    container_name: ir_retrieval
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      IR_EMBED_DEVICE: "cpu"   # override via docker-compose.gpu.yml
+    volumes:
+      - ./data:/app/data
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  refinement:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: refinement
+    image: ir-project/refinement:latest
+    container_name: ir_refinement
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      EAGER_INIT: "True"
+    volumes:
+      - ./data:/app/data
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 10s
+
+  rag:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: rag
+    image: ir-project/rag:latest
+    container_name: ir_rag
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      RAG_RETRIEVAL_URL: "http://retrieval:8000"
+      RAG_PREPROCESSING_URL: "http://preprocessing:8000"
+    volumes:
+      - rag_cache:/root/.cache/huggingface
+    networks: [irnet]
+
+  clustering:
+    build:
+      context: .
+      dockerfile: services/backend.Dockerfile
+      args:
+        SERVICE_NAME: clustering
+    image: ir-project/clustering:latest
+    container_name: ir_clustering
+    restart: unless-stopped
+    expose:
+      - "8000"
+    environment:
+      CLUSTERING_RETRIEVAL_URL: "http://retrieval:8000"
+    volumes:
+      - ./data:/app/data
+    networks: [irnet]
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  rag_cache:
+
+networks:
+  irnet:
+    driver: bridge

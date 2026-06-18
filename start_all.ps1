@@ -1,0 +1,54 @@
+# start_all.ps1 - Launch IR project services
+# Run this from the repo root:  .\start_all.ps1
+# Each service opens its own PowerShell window with visible logs.
+# Gateway: http://localhost:8000/docs
+# UI:      http://localhost:5173
+#
+# Clustering is optional (off by default). Enable with:
+#   .\start_all.ps1 -Clustering
+
+param([switch]$Clustering)
+
+$root = "F:\IR project"
+$venvActivate = "$root\.venv\Scripts\Activate.ps1"
+$uiDir = "$root\services\ui"
+
+$backendServices = @(
+    @{name="preprocessing"; port=8001; mod="services.preprocessing.app.pipeline:app"}
+    @{name="indexing";       port=8002; mod="services.indexing.app.service:app"}
+    @{name="retrieval";      port=8003; mod="services.retrieval.app.service:app"}
+    @{name="refinement";     port=8004; mod="services.refinement.app.service:app"}
+    @{name="rag";            port=8005; mod="services.rag.app.service:app"}
+    @{name="gateway";        port=8000; mod="services.gateway.app.main:app"}
+)
+
+if ($Clustering) {
+    $backendServices += @{name="clustering"; port=8006; mod="services.clustering.app.service:app"}
+}
+
+Write-Host "=== IR Project - Starting All Services ===" -ForegroundColor Cyan
+Write-Host ""
+
+# 1. Start backend services in dependency order
+foreach ($svc in $backendServices) {
+    $title = "IR: $($svc.name) (port $($svc.port))"
+    Write-Host "  Starting $title ..." -ForegroundColor Yellow
+    $cmd = ". '$venvActivate'; uvicorn $($svc.mod) --host 0.0.0.0 --port $($svc.port)"
+    $arg = "-NoExit", "-Command", $cmd
+    Start-Process powershell -WindowStyle Normal -ArgumentList $arg
+    Start-Sleep -Seconds 3
+}
+
+# 2. Start React UI (npm run dev)
+Write-Host "  Starting UI (:5173) ..." -ForegroundColor Yellow
+$uiCmd = "cd '$uiDir'; npm run dev"
+$uiArg = "-NoExit", "-Command", $uiCmd
+Start-Process powershell -WindowStyle Normal -ArgumentList $uiArg
+
+Write-Host ""
+Write-Host "=== All services launched ===" -ForegroundColor Green
+Write-Host "  Gateway: http://localhost:8000/docs"
+Write-Host "  UI:      http://localhost:5173"
+if (-not $Clustering) {
+    Write-Host "  Clustering: OFF (add -Clustering to enable)" -ForegroundColor DarkYellow
+}
